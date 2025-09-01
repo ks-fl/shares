@@ -1,0 +1,232 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AWS CloudWatch Logs to S3 via Kinesis Firehose pipeline with Lambda transformation
+  for JSON to Parquet conversion and Athena integration.
+
+Parameters:
+  LogsBucketName:
+    Type: String
+    Description: The name of the S3 bucket to store logs.
+    Default: "your-logs-bucket-name"
+
+Resources:
+  # ------------------------------------------------------------------
+  # 1. S3 Bucket for Processed Logs
+  # ------------------------------------------------------------------
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref LogsBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # ------------------------------------------------------------------
+  # 2. AWS Glue Data Catalog Database & Table
+  # ------------------------------------------------------------------
+  LogsGlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: application_logs_db
+        Description: Glue database for transformed application logs.
+
+  LogsGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref LogsGlueDatabase
+      TableInput:
+        Name: application_logs_transformed
+        Description: Transformed application logs from CloudWatch via Firehose
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+        StorageDescriptor:
+          Columns:
+            - Name: timestamp
+              Type: string
+            - Name: message
+              Type: string
+            - Name: level
+              Type: string
+            - Name: application_name
+              Type: string
+          Location: !Sub "s3://${LogsBucketName}/logs/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+
+  # ------------------------------------------------------------------
+  # 3. Lambda Function for Data Transformation
+  # ------------------------------------------------------------------
+  LogTransformFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./log-transform/
+      Handler: app.lambda_handler
+      Runtime: python3.13
+      Architectures:
+        - x86_64
+      FunctionName: firehose-log-transform
+      Timeout: 300
+
+  # ------------------------------------------------------------------
+  # 4. IAM Roles
+  # ------------------------------------------------------------------
+  CloudWatchLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsToFirehosePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource: !GetAtt KinesisFirehoseDeliveryStream.Arn
+
+  FirehoseServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseS3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${LogsBucketName}"
+                  - !Sub "arn:aws:s3:::${LogsBucketName}/*"
+        - PolicyName: FirehoseLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt LogTransformFunction.Arn
+        - PolicyName: FirehoseCloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/logs-delivery-stream:log-stream:S3Delivery'
+        - PolicyName: FirehoseGlueAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetDatabase
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                Resource: 
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${LogsGlueDatabase}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${LogsGlueDatabase}/${LogsGlueTable}'
+
+  # ------------------------------------------------------------------
+  # 5. CloudWatch Log Group (Firehose用)
+  # ------------------------------------------------------------------
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/kinesisfirehose/logs-delivery-stream
+      RetentionInDays: 14
+
+  FirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref FirehoseLogGroup
+      LogStreamName: S3Delivery
+
+  # ------------------------------------------------------------------
+  # 6. Kinesis Firehose Delivery Stream
+  # ------------------------------------------------------------------
+  KinesisFirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: logs-delivery-stream
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt LogsBucket.Arn
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 64
+        Prefix: logs/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/
+        ErrorOutputPrefix: errors/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/
+        RoleARN: !GetAtt FirehoseServiceRole.Arn
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt LogTransformFunction.Arn
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+          LogStreamName: !Ref FirehoseLogStream
+
+Outputs:
+  LogsBucketNameOutput:
+    Description: "S3 Bucket Name for Processed Logs"
+    Value: !Ref LogsBucketName
+    Export:
+      Name: !Sub "${AWS::StackName}-LogsBucketName"
+  
+  KinesisFirehoseDeliveryStreamName:
+    Description: "Kinesis Firehose Delivery Stream Name"
+    Value: !Ref KinesisFirehoseDeliveryStream
+    Export:
+      Name: !Sub "${AWS::StackName}-KinesisFirehoseDeliveryStreamName"
+  
+  LogsGlueTableName:
+    Description: "Glue Table Name for Athena"
+    Value: !Ref LogsGlueTable
+    Export:
+      Name: !Sub "${AWS::StackName}-LogsGlueTableName"
+  
+  CloudWatchLogsRoleOutput:
+    Description: "CloudWatch Logs Service Role ARN"
+    Value: !GetAtt CloudWatchLogsRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudWatchLogsRole"
